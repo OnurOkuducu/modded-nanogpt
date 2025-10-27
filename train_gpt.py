@@ -939,6 +939,116 @@ class Block(nn.Module):
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GPTSelective(GPT):
+    """
+    GPT model with a selective answering gate gθ(x, c) ∈ [0,1]
+    and the selective loss:
+        L = g * CE + (1 - g) * λ + β * Reg(g)
+    """
+
+    def __init__(self, vocab_size, num_layers, num_heads, head_dim, model_dim, max_seq_len):
+        super().__init__(vocab_size, num_layers, num_heads, head_dim, model_dim, max_seq_len)
+
+        # ---- New abstention gate head ----
+        self.gate_head = nn.Sequential(
+            nn.Linear(model_dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(
+        self,
+        input_seq: torch.Tensor,
+        target_seq: torch.Tensor,
+        seqlens: torch.Tensor,
+        ws_short: int,
+        ws_long: int,
+        lambda_penalty: float = 0.2,
+        beta: float = 0.01,
+    ):
+        assert input_seq.ndim == 1
+
+        # ===== everything below is same as original GPT.forward() =====
+        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+        ve = [None, ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+        assert len(ve) == len(self.blocks)
+
+        short_bm = ws_short * args.block_size
+        long_bm = ws_long * args.block_size
+        bm_sizes = [
+            None, short_bm, short_bm, short_bm,
+            long_bm, short_bm, short_bm,
+            None, short_bm, short_bm, short_bm, long_bm
+        ]
+        assert len(bm_sizes) == len(self.blocks)
+
+        x = self.embed(input_seq)
+
+        smear_lambda = self.scalars[5 * len(self.blocks)]
+        smear_gate_out = smear_lambda * torch.sigmoid(
+            self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)])
+        )
+        x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
+        x = x0 = norm(x[None])
+
+        skip_connections = []
+        skip_weights = self.scalars[: (len(self.blocks) // 2)]
+        lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
+        sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
+        backout_lambda = self.scalars[5 * len(self.blocks) + 1]
+
+        n = len(self.blocks) // 2
+        x_backout = None
+        backout_layer = 8
+
+        for i in range(1, len(self.blocks)):
+            attn_args = AttnArgs(
+                ve=ve[i],
+                sa_lambdas=sa_lambdas[i],
+                seqlens=seqlens,
+                bm_size=bm_sizes[i],
+                cos=self.yarn.cos,
+                sin=self.yarn.sin,
+                attn_scale=self.yarn.attn_scale,
+            )
+            if i >= n and i < 11:
+                gate = torch.sigmoid(skip_weights[i - n])
+                x = x + gate * skip_connections.pop()
+            x = self.blocks[i](x, x0, lambdas[i], attn_args)
+            if i < n:
+                skip_connections.append(x)
+            if i == backout_layer:
+                x_backout = x
+
+        # ======== New part (replaces last 10 lines) ========
+        x -= backout_lambda * x_backout
+        x = norm(x)
+
+        # --- LM head ---
+        logits = self.lm_head(x)
+        logits = 30 * torch.sigmoid(logits / 7.5)
+        logits_for_loss = logits.float() if not self.training else logits
+
+        # --- Gate head: one value per sequence, based on final token ---
+        g = self.gate_head(x[:, -1, :])  # shape [B, 1]
+
+        # --- Cross-entropy loss (standard token-level) ---
+        ce = F.cross_entropy(
+            logits_for_loss.view(-1, logits_for_loss.size(-1)),
+            target_seq,
+            reduction="none",
+        ).mean()
+
+        # --- Regularization term for gate entropy ---
+        reg = (g * torch.log(g + 1e-8) + (1 - g) * torch.log(1 - g + 1e-8)).mean()
+
+        # --- Final selective loss ---
+        loss = (g * ce + (1 - g) * lambda_penalty + beta * reg).mean()
+
+        return loss
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1304,7 +1414,7 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(
+model: nn.Module = GPTSelective(
     vocab_size=50257,
     num_layers=12,
     num_heads=6,
