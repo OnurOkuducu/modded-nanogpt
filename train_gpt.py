@@ -474,10 +474,10 @@ class Hyperparameters:
     num_iterations = 1770 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    val_loss_every = 0#125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 500#125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
-    seq_len = 6*2048 # FlexAttention sequence length
-    val_seq_len =6* 2048 # FlexAttention sequence length for validation
+    seq_len = 48*1024 # FlexAttention sequence length
+    val_seq_len = 48*1024 # FlexAttention sequence length for validation
     save_checkpoint =True 
 args = Hyperparameters()
 
