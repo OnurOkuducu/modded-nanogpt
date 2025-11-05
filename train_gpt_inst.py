@@ -586,7 +586,7 @@ print0("="*100)
 train_batch_size = world_size * args.seq_len
 train_loader = distributed_data_generator(args.train_files, train_batch_size, rank, world_size)
 
-model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+model: nn.Module = GPT(vocab_size=50259, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
