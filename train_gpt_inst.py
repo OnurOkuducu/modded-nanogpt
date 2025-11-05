@@ -347,7 +347,41 @@ class ValueEmbedding(nn.Module):
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
-
+    
+def build_ignore_mask_stream(target_seq: torch.Tensor,
+                         ins_id: int = INS_ID,
+                         ctx_id: int = CTX_ID,
+                         eot_id: int = EOT_ID) -> torch.Tensor:
+    """
+    target_seq: 1D int64 cuda tensor (the same shape/dtype you pass to CE)
+    Returns: bool cuda tensor mask_ignore where True => ignore this position in loss.
+    Logic:
+      - toggle 'inside_ins' on every <ins>; toggle 'inside_ctx' on every <ctx>
+      - reset both to False on every <|endoftext|>
+      - ignore all tokens when inside_ins or inside_ctx
+      - also ignore the markers themselves (<ins>, <ctx>)
+    """
+    ids = target_seq.detach().cpu().tolist()
+    mask = [False] * len(ids)
+    inside_ins = False
+    inside_ctx = False
+    for i, t in enumerate(ids):
+        if t == eot_id:
+            inside_ins = False
+            inside_ctx = False
+            mask[i] = True  # usually you'd ignore predicting EOT as well
+            continue
+        if t == ins_id:
+            inside_ins = not inside_ins
+            mask[i] = True  # mask the marker token itself
+            continue
+        if t == ctx_id:
+            inside_ctx = not inside_ctx
+            mask[i] = True  # mask the marker token itself
+            continue
+        if inside_ins or inside_ctx:
+            mask[i] = True
+    return torch.tensor(mask, device=target_seq.device, dtype=torch.bool)
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
@@ -404,41 +438,6 @@ class GPT(nn.Module):
             )
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
-
-    def build_ignore_mask_stream(target_seq: torch.Tensor,
-                             ins_id: int = INS_ID,
-                             ctx_id: int = CTX_ID,
-                             eot_id: int = EOT_ID) -> torch.Tensor:
-        """
-        target_seq: 1D int64 cuda tensor (the same shape/dtype you pass to CE)
-        Returns: bool cuda tensor mask_ignore where True => ignore this position in loss.
-        Logic:
-          - toggle 'inside_ins' on every <ins>; toggle 'inside_ctx' on every <ctx>
-          - reset both to False on every <|endoftext|>
-          - ignore all tokens when inside_ins or inside_ctx
-          - also ignore the markers themselves (<ins>, <ctx>)
-        """
-        ids = target_seq.detach().cpu().tolist()
-        mask = [False] * len(ids)
-        inside_ins = False
-        inside_ctx = False
-        for i, t in enumerate(ids):
-            if t == eot_id:
-                inside_ins = False
-                inside_ctx = False
-                mask[i] = True  # usually you'd ignore predicting EOT as well
-                continue
-            if t == ins_id:
-                inside_ins = not inside_ins
-                mask[i] = True  # mask the marker token itself
-                continue
-            if t == ctx_id:
-                inside_ctx = not inside_ctx
-                mask[i] = True  # mask the marker token itself
-                continue
-            if inside_ins or inside_ctx:
-                mask[i] = True
-        return torch.tensor(mask, device=target_seq.device, dtype=torch.bool)
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
