@@ -491,18 +491,38 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
+EOT_ID = 50256
+
+def _advance_to_next_eot(tokens: torch.Tensor, start: int, end: int) -> int:
+    """
+    Returns a position >= start such that tokens[pos] == EOT_ID (if one exists before `end`);
+    otherwise returns start unchanged.
+    """
+    # cheap linear scan; window is at most local_batch_size
+    arr = tokens[start:end].tolist()
+    for i, t in enumerate(arr):
+        if t == EOT_ID:
+            return start + i
+    return start
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int, world_size: int):
     files = sorted(Path.cwd().glob(filename_pattern))
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
-    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
+    file_iter = iter(files)
     tokens, pos = _load_data_shard(next(file_iter)), 0
     while True:
         if pos + batch_size + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
-        buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
+
+        # NEW: nudge pos to start at/after the next EOT within this step window
+        window_start = pos + rank * local_batch_size
+        window_end   = window_start + local_batch_size + 1
+        window_start = _advance_to_next_eot(tokens, window_start, window_end)
+
+        buf = tokens[window_start:window_start + local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
         pos += batch_size
         yield inputs, targets
 
