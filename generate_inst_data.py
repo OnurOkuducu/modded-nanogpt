@@ -219,16 +219,27 @@ if __name__ == "__main__":
     random.seed(args.seed)
 
     # -----------------------------------------------------------
-    # Load OpenWebText
+    # Load OpenWebText (streaming or full, depending on num_samples)
     # -----------------------------------------------------------
     print("[+] Loading Skylion007/openwebtext ...")
-    ds = load_dataset("Skylion007/openwebtext", split="train")
-    if args.num_samples is not None:
-        ds = ds.select(range(min(args.num_samples, len(ds))))
-        print(f"[+] Using subset: {len(ds)} samples")
-
+    
+    if args.num_samples is not None and args.num_samples <= 5000:
+        # ⚡ Light mode for Colab/debugging: use streaming API
+        ds_stream = load_dataset("Skylion007/openwebtext", split="train", streaming=True)
+        ds = []
+        print(f"[+] Streaming first {args.num_samples} samples ...")
+        for i, ex in enumerate(ds_stream.take(args.num_samples)):
+            ds.append(ex)
+        print(f"[✓] Loaded {len(ds)} samples in streaming mode.")
+    else:
+        # 💾 Full download mode for large-scale generation
+        ds = load_dataset("Skylion007/openwebtext", split="train")
+        if args.num_samples is not None:
+            ds = ds.select(range(min(args.num_samples, len(ds))))
+            print(f"[+] Using subset: {len(ds)} samples")
+    
     # -----------------------------------------------------------
-    # Iterate and tokenize into shards (no nonlocal needed)
+    # Iterate and tokenize into shards
     # -----------------------------------------------------------
     class ShardBuffer:
         def __init__(self, out_dir: str, shard_size: int):
@@ -252,20 +263,16 @@ if __name__ == "__main__":
     
         def add(self, toks: np.ndarray):
             n = len(toks)
-            # fits current shard
             if self.token_count + n <= self.shard_size:
                 self.buf[self.token_count:self.token_count + n] = toks
                 self.token_count += n
                 self.pbar.update(n)
                 return
-    
-            # fill remainder of current shard, flush, then continue with leftover
             remainder = self.shard_size - self.token_count
             if remainder > 0:
                 self.buf[self.token_count:self.token_count + remainder] = toks[:remainder]
                 self.pbar.update(remainder)
             self.flush()
-    
             leftover = n - remainder
             if leftover > 0:
                 self.buf[:leftover] = toks[remainder:]
@@ -274,8 +281,11 @@ if __name__ == "__main__":
     
     shards = ShardBuffer(args.out_dir, args.shard_size)
     
-    for ex in ds:
-        raw = ex.get("text", "")
+    # Handle both list (non-streaming) and iterable (streaming)
+    iterator = ds if isinstance(ds, list) else ds
+    
+    for ex in iterator:
+        raw = ex.get("text", "") if isinstance(ex, dict) else ex["text"]
         text = clean_text(raw)
         if len(text) < 10:
             continue
@@ -290,7 +300,6 @@ if __name__ == "__main__":
     
         shards.add(toks)
     
-    # write final shard
     shards.flush()
     print("[✓] Finished building OpenWebText instruction dataset with <ins>/<ctx> markers.")
 
