@@ -17,7 +17,7 @@ Usage:
     python generate_inst_data.py --out_dir owt_instruct --shard_size 10000000 --next_token_prob 0.5 --num_samples 500000
 
 Requirements:
-    pip install datasets tiktoken tqdm numpy
+    pip install datasets==3.6.0 tiktoken tqdm numpy
 """
 
 import os
