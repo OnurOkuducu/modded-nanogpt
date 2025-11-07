@@ -468,6 +468,8 @@ class GPT(nn.Module):
             nn.Tanh(),
             nn.Linear(model_dim, 1),
         )
+        self.abstain_head = self.abstain_head.to(torch.bfloat16)
+
     def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
         docs = (input_seq == 50256).cumsum(0)
