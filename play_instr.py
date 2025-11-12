@@ -4,12 +4,12 @@ from train_gpt_inst import GPT, next_multiple_of_n  # your GPT definition
 
 # === Config ===
 device = "cuda"
-checkpoint_path = "/workspace/modded-nanogpt/logs/8aba7c76-054f-494b-8514-8af4d34406fa/state_step010000.pt"
+checkpoint_path = '/workspace/modded-nanogpt/logs/85a8d212-b6ff-4007-b702-14aaf40e9183/state_step020000.pt'
 vocab_size = 50259   # 50257 + <ins> + <ctx>
 num_layers = 12
 num_heads = 6
 model_dim = 768
-max_seq_len = 12*1024
+max_seq_len = 48*1024
 
 # === Tokenizer with <ins> and <ctx> ===
 base_enc = tiktoken.get_encoding("gpt2")
@@ -49,7 +49,7 @@ def uncap_logits(logits):
     logits = torch.logit(logits / 30, eps=1e-6) * 7.5
     return logits
 
-# === Generation ===
+
 # === Generation ===
 @torch.no_grad()
 def generate(model, prompt, max_new_tokens=100, temperature=0.8, top_k=200):
@@ -164,15 +164,86 @@ def generate_multiple(
 
     return generations
 
+@torch.no_grad()
+def generate(model, prompt, max_new_tokens=100, temperature=0.8, top_k=200):
+    input_ids = torch.tensor(encode(prompt), dtype=torch.int32, device=device)
+
+    BLOCK_SIZE = 128
+    PAD_TOKEN = 50256  # <|endoftext|>
+
+    # --- Initial pad ---
+    pad_len = (-len(input_ids)) % BLOCK_SIZE
+    if pad_len > 0:
+        pad = torch.full((pad_len,), PAD_TOKEN, dtype=input_ids.dtype, device=input_ids.device)
+        input_ids = torch.cat([pad, input_ids])
+
+    sw_blocks = torch.tensor(model.lm_head.out_features // BLOCK_SIZE, dtype=torch.int32, device=device)
+
+    for step in range(max_new_tokens):
+        # --- Forward pass ---
+        logits = model.inference(input_ids, sw_blocks)
+        if logits.ndim == 3:
+            logits = logits[0]  # ensure shape [T, V]
+        logits = logits[-1, :50259] / temperature
+
+        # --- Top-k sampling ---
+        if top_k:
+            v, _ = torch.topk(logits, top_k)
+            logits[logits < v[-1]] = -float("inf")
+
+        probs = torch.softmax(logits, dim=-1)
+        next_id = torch.multinomial(probs, num_samples=1)
+
+        # Append new token
+        input_ids = torch.cat((input_ids, next_id))
+
+        # ✅ Re-pad to multiple of 128 every iteration
+        pad_len = (-len(input_ids)) % BLOCK_SIZE
+        if pad_len > 0:
+            pad = torch.full((pad_len,), PAD_TOKEN, dtype=input_ids.dtype, device=input_ids.device)
+            input_ids = torch.cat([pad, input_ids])
+
+        if next_id.item() == PAD_TOKEN:
+            break
+    # --- Clean decode: remove all <|endoftext|> tokens ---
+    output_ids = [tid for tid in input_ids.tolist() if tid != PAD_TOKEN]
+    text = decode(output_ids).replace("<|endoftext|>", "").strip()
+    return text
+
+    #return decode(input_ids.tolist())
+
 #prompt = "<ins>Ignore the text and answer: how many legs does a spider have?<ins><ctx>denememe<ctx>D "
 prompt = "<ins>Guess the next token, if you are not sure say IDK.<ins> The quick brown fox"
 prompt = "<ins>Ignore the text and answer: how many legs does a spider have?<ins><ctx>Spiders are arachnids.<ctx>"
+prompt = '<ins>Ignore the text and answer: what is the capital of Turkey?<ins><ctx>Spiders are arachnids.<ctx>' 
 
-outputs = generate_multiple(model, prompt, n=5, max_new_tokens=10, temperature=0.8)
+#output = generate(model, prompt, max_new_tokens=100, temperature=0.8)
 
-for i, o in enumerate(outputs, 1):
-    print(f"\n🧠 Generation {i}:")
-    print(o)
+#print(output)
 
-#get_token_probability_with_topk(model, prompt, target_str="8")
+prompt = '<ins>Ignore the text and answer: how many legs does a spider have?<ins><ctx>Spiders are arachnids.<ctx>'
+output = generate(model, prompt, max_new_tokens=30, temperature=0.8)
+
+print(output)
+
+prompt = '<ins>Ignore the text and answer: what is the capital of France?<ins><ctx>Spiders are arachnids.<ctx>'
+output = generate(model, prompt, max_new_tokens=30, temperature=0.8)
+
+print(output)
+
+prompt = '<ins>Ignore the text and tell me if Istanbul is the capital of Turkey?<ins><ctx>Spiders are arachnids.<ctx> '
+
+output = generate(model, prompt, max_new_tokens=30, temperature=0.8)
+
+print(output)
+
+prompt = '<ins>How many words are in the following text?<ins><ctx>Spiders are arachnids.<ctx>'
+output = generate(model, prompt, max_new_tokens=30, temperature=0.8)
+
+print(output)
+
+prompt = '<ins>What is the first word of the following text?<ins><ctx>Spiders are arachnids.<ctx>'
+output = generate(model, prompt, max_new_tokens=30, temperature=0.8)
+
+print(output)
 

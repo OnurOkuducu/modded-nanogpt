@@ -14,7 +14,7 @@ Each sample is preceded by <|endoftext|> and formatted as:
 <ins>{QUESTION}<ins><ctx>{TEXT}<ctx> {ANSWER}
 
 Usage:
-    python generate_inst_data.py --out_dir owt_instruct --shard_size 10000000 --next_token_prob 0.5 --num_samples 500000
+    python generate_inst_data_v2.py --out_dir owt_instruct --shard_size 10000000 --next_token_prob 0.3 --num_samples 1000000
 
 Requirements:
     pip install datasets==3.6.0 tiktoken tqdm numpy
