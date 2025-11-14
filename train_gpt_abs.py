@@ -644,8 +644,8 @@ class GPT(nn.Module):
         sliding_window_num_blocks: Tensor,
         *,
         valid_mask: Tensor | None = None,     # [T] bool (answer & not-ignored), precomputed
-        lambda_penalty: float = 0.2,
-        beta_reg: float = 0.01,
+        lambda_penalty: float = 1.5,
+        beta_reg: float = 5.0,
         kappa: float = 0.5,
         return_logits: bool = False,
         use_capped_logits: bool = True,
@@ -692,7 +692,7 @@ class GPT(nn.Module):
 
         if return_logits:
             return loss, logits, g_t.detach()
-        return loss
+        return loss , g_t
     @torch.no_grad()
     def inference(
         self,
@@ -865,7 +865,7 @@ if __name__ == '__main__':
     print(len(abstain_params))
 
     # init the optimizer(s)
-    adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04),dict(params=abstain_params, lr=0.02)]
+    adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04),dict(params=abstain_params, lr=0.0001)]
     # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
     # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
     optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
@@ -933,7 +933,7 @@ if __name__ == '__main__':
                     y = y_cpu.to(device, non_blocking=True)
                     valid_mask = valid_mask_cpu.to(device, non_blocking=True)
 
-                    loss_i = model(
+                    loss_i,abstain = model(
                         x, y, sw_num_blks(window_size),
                         return_logits=False,
                         use_capped_logits=True,
@@ -1014,7 +1014,7 @@ if __name__ == '__main__':
             # ---- 3) single micro-step (no accumulation): zero -> fwd -> bwd -> allreduce -> step
             model.zero_grad(set_to_none=True)
 
-            loss = model(
+            loss,g_t = model(
                 input_seq=input_seq,
                 target_seq=target_seq,
                 sliding_window_num_blocks=sw_num_blks(window_size).to(device),
@@ -1024,8 +1024,10 @@ if __name__ == '__main__':
             )
 
             loss.backward()
-
-            # average grads across ranks
+            with torch.no_grad():
+                gm = float(g_t[valid_mask].mean()) if valid_mask.any() else float('nan')
+            print("Loss:", loss.item(), "| g_mean(valid):", f"{gm:.3f}")
+            print('Loss: ',loss)
             for p in model.parameters():
                 if p.grad is not None:
                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)

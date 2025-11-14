@@ -4,7 +4,8 @@ from train_gpt_abs import GPT, next_multiple_of_n  # your GPT with abstention he
 
 # === Config ===
 device = "cuda"
-checkpoint_path = '/workspace/modded-nanogpt/logs/25b4c2e5-4878-474f-a82a-e58668a186cf/state_step005000.pt' 
+#checkpoint_path = '/workspace/modded-nanogpt/logs/25b4c2e5-4878-474f-a82a-e58668a186cf/state_step005000.pt' 
+checkpoint_path = "/workspace/modded-nanogpt/logs/4ca4ad16-ac74-42d3-b9bd-f1fd1651d20f/state_step005000.pt"
 vocab_size = 50259   # 50257 + <ins>=50257 + <ctx>=50258
 num_layers = 12
 num_heads = 6
@@ -140,15 +141,16 @@ def generate_with_abstention(
 
 # === Example usage ===
 if __name__ == "__main__":
-    prompt = '<ins>Ignore the text and answer: how many legs does a spider have?<ins><ctx>Spiders are arachnids.<ctx>'
     '''
+    prompt = '<ins>Ignore the text and answer: how many legs does a spider have?<ins><ctx>Spiders are arachnids.<ctx>'
+    ''''''
     # Single pass: per-token logits and gates for the given prompt
     logits_TV, gates_T, tokens_T = run_inference_once(prompt, use_capped_logits=True)
     print(f"logits shape: {tuple(logits_TV.shape)}, gates shape: {tuple(gates_T.shape)}")
     # Example: gates at </ctx> positions
     ctx_pos = (tokens_T == CTX_ID).nonzero().flatten().tolist()
     print("ctx positions & gates:", [(p, float(gates_T[p])) for p in ctx_pos])
-    '''
+    ''''''
     # Autoregressive generation with both outputs
     out_text, steps = generate_with_abstention(prompt, max_new_tokens=40, temperature=0.8, top_k=200)
     print("\n=== Generation ===")
@@ -156,4 +158,20 @@ if __name__ == "__main__":
     print("\n=== Steps (last 3) ===")
     for s in steps[-3:]:
         print(s)
+    '''
+    # --- Prompt list ---
+    prompts = [
+        "<ins>Ignore the text and answer: how many legs does a spider have?<ins><ctx>Spiders are arachnids.<ctx>",
+        "<ins>Ignore the text and answer: what is the capital of France?<ins><ctx>Spiders are arachnids.<ctx>",
+        "<ins>Ignore the text and tell me if Istanbul is the capital of Turkey?<ins><ctx>Spiders are arachnids.<ctx> ",
+        "<ins>How many words are in the following text?<ins><ctx>Spiders are arachnids.<ctx>",
+        "<ins>What is the first word of the following text?<ins><ctx>Spiders are arachnids.<ctx>",
+    ]
 
+    # --- Run plain generate on each prompt ---
+    print("\n================ PLAIN GENERATION ================\n")
+    for i, prompt in enumerate(prompts, 1):
+        out, _= generate_with_abstention(prompt, max_new_tokens=30, temperature=0.8, top_k=200)
+        print(f"[{i}] Prompt:\n{prompt}\n")
+        print(f"[{i}] Output:\n{out}\n")
+        print("-" * 80)

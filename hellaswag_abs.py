@@ -12,8 +12,8 @@ num_heads  = 6
 model_dim  = 768
 max_seq_len = 48 * 1024
 
-CHECKPOINT = "/workspace/modded-nanogpt/logs/25b4c2e5-4878-474f-a82a-e58668a186cf/state_step005000.pt"
-N_EVAL     = 500   # set to len(ds) for full eval
+CHECKPOINT = "/workspace/modded-nanogpt/logs/4ca4ad16-ac74-42d3-b9bd-f1fd1651d20f/state_step005000.pt"
+N_EVAL     = 400   # set to len(ds) for full eval
 BLOCK_SIZE = 128
 PAD_TOKEN  = 50256
 
@@ -69,7 +69,7 @@ def score_continuation_abstain(model: GPT, prompt: str, continuation: str, lambd
     logprobs = torch.log_softmax(logits, dim=-1)      # [T-1,V]
     target   = input_ids[1:]                          # [T-1]
     gates_t  = gates[:-1]                             # [T-1]
-    breakpoint()
+    #breakpoint()
     cont_start = len(prompt_ids)
     cont_start_idx = pad_len + cont_start
 
@@ -187,7 +187,7 @@ if __name__ == "__main__":
     evaluate_hellaswag_abstain(
         model,
         n_examples=N_EVAL,
-        gate_threshold=0.005,
+        gate_threshold=0.4,
         lambda_penalty=None,   # or set to your training lambda (e.g., 0.2) if you want
     )
 
