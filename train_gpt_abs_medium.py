@@ -1,0 +1,1109 @@
+import itertools
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import time
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import torch
+torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
+#os.environ["DISABLE_FP8"] = "1"  # your repo reads this to set use_fp8=False
+#torch._inductor.config.force_disable_fp8 = True  # stop Inductor FP8 lowering
+from torch import Tensor, nn
+import torch.nn.functional as F
+import torch.distributed as dist
+# use of FlexAttention contributed by @KoszarskyB
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
+
+# -----------------------------------------------------------------------------
+# Custom operators : FP8 matmul by @YouJiacheng
+
+
+INS_ID = 50257      # <ins>
+CTX_ID = 50258      # <ctx>
+EOT_ID = 50256      # <|endoftext|>
+#Constants
+
+@torch.library.custom_op("nanogpt::mm", mutates_args=())
+def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+    @torch.compile
+    def impl(x: Tensor, w: Tensor):
+        assert x.is_contiguous() and w.is_contiguous()
+        x_f8 = x.mul(x_s).to(torch.float8_e4m3fn)
+        w_f8 = w.mul(w_s).to(torch.float8_e4m3fn)
+        out = torch._scaled_mm(
+            x_f8,
+            w_f8.t(),
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(1 / x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(1 / w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+        return out, x_f8, w_f8
+
+    return impl(x, w)
+
+@mm_op.register_fake
+def _(x: Tensor, w: Tensor, *_):
+    assert x.ndim == w.ndim == 2
+    assert x.shape[1] == w.shape[1]
+    assert x.device == w.device
+    assert x.is_contiguous() and w.is_contiguous()
+    return x @ w.t(), x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+
+@torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
+def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
+    @torch.compile
+    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
+        assert grad.is_contiguous()
+        x_inv_s = grad.new_tensor(1 / x_s, dtype=torch.float32)
+        w_inv_s = grad.new_tensor(1 / w_s, dtype=torch.float32)
+        grad_inv_s = grad.new_tensor(1 / grad_s, dtype=torch.float32)
+        grad_f8 = grad.mul(grad_s).to(torch.float8_e5m2)
+        grad_x = torch._scaled_mm(
+            grad_f8,
+            w_f8.t().contiguous().t(),
+            out_dtype=torch.bfloat16,
+            scale_a=grad_inv_s,
+            scale_b=w_inv_s,
+            use_fast_accum=False,
+        )
+        # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
+        grad_w = torch._scaled_mm(
+            x_f8.t().contiguous(),
+            grad_f8.t().contiguous().t(),
+            out_dtype=torch.float32,
+            scale_a=x_inv_s,
+            scale_b=grad_inv_s,
+            use_fast_accum=False,
+        ).t()
+        return grad_x, grad_w
+
+    return impl(g, x_f8, w_f8)
+
+@mm_backward_op.register_fake
+def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
+
+def backward(ctx, grad_out: Tensor, *_):
+    x_f8, w_f8 = ctx.saved_tensors
+    x_s, w_s, grad_s = ctx.scales
+    grad_x, grad_w = torch.ops.nanogpt.mm_backward(
+        grad_out, x_f8, w_f8, x_s, w_s, grad_s
+    )
+    return grad_x, grad_w, None, None, None
+
+def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+    *_, x_s, w_s, grad_s = inputs
+    _, x_f8, w_f8 = output
+    ctx.save_for_backward(x_f8, w_f8)
+    ctx.scales = x_s, w_s, grad_s
+    ctx.set_materialize_grads(False)
+
+mm_op.register_autograd(backward, setup_context=setup_context)
+
+# -----------------------------------------------------------------------------
+# Muon optimizer
+
+@torch.compile
+def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+    
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven"t tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iteration steps to use.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+        self.rank = rank
+        self.world_size = world_size
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        params: list[Tensor] = [*params]
+        assert all(isinstance(p, Tensor) for p in params)
+        sizes = {p.numel() for p in params}
+        def create_update_buffer(size: int):
+            b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device="cuda")
+            return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(self.world_size)])
+        param_groups = [
+            dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size)) for size in sizes]
+        super().__init__(param_groups, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            update_buffer = group["update_buffer"]
+            update_buffer_views: list[Tensor] = group["update_buffer_views"]
+            # generate weight updates in distributed fashion
+            params: list[Tensor] = group["params"]
+            handle = None
+            params_world = None
+            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
+                if params_world is None:
+                    return
+                assert handle is not None
+                handle.wait()
+                for p_world, g_world in zip(params_world, update_buffer_views):
+                    p_world.add_(
+                        g_world.view_as(p_world),
+                        alpha=-lr * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5,
+                    )
+            for base_i in range(len(params))[::self.world_size]:
+                if base_i + self.rank < len(params):
+                    p = params[base_i + self.rank]
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf: Tensor = state["momentum_buffer"]
+                    buf.lerp_(g, 1 - momentum)
+                    g = g.lerp_(buf, momentum) if nesterov else buf
+                    g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+                else:
+                    g = update_buffer_views[self.rank]
+                update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
+                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
+                params_world = params[base_i : base_i + self.world_size]
+            update_prev()
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the model
+
+def norm(x: Tensor):
+    return F.rms_norm(x, (x.size(-1),))
+
+class CastedLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, use_fp8: bool = False, x_s: float = 1.0, w_s: float = 1.0, grad_s: float = 1.0):
+        super().__init__(in_features, out_features, bias=False)
+        self.use_fp8 = use_fp8
+        self.x_s = x_s
+        self.w_s = w_s
+        self.grad_s = grad_s
+
+    def reset_parameters(self) -> None:
+        std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
+
+    def forward(self, x: Tensor):
+        if self.use_fp8 and self.training:
+            _x = x.flatten(0, -2)
+            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
+            return out.reshape(*x.shape[:-1], -1)
+        else:
+            return F.linear(x, self.weight.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int):
+        super().__init__()
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.cos = nn.Buffer(theta.cos(), persistent=False)
+        self.sin = nn.Buffer(theta.sin(), persistent=False)
+
+    def forward(self, x_BTHD: Tensor):
+        assert self.cos.size(0) >= x_BTHD.size(-3)
+        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        hdim = num_heads * head_dim
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
+        # https://x.com/hi_tysam/status/1879699187107033311
+        self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.rotary = Rotary(head_dim, max_seq_len)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
+        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        self.attn_scale = 0.12
+
+    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = self.rotary(q), self.rotary(k)
+        if ve is not None:
+            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = self.lambdas[0] * v
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.c_fc = CastedLinear(dim, hdim)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x: Tensor):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
+        super().__init__()
+        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
+        self.mlp = MLP(dim)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        if self.attn is not None:
+            x = x + self.attn(norm(x), ve, block_mask)
+        x = x + self.mlp(norm(x))
+        return x
+
+class ValueEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, embedding_dim: int, num_layers: int, num_embeddings: int = 3):
+        super().__init__()
+        self.num_layers = num_layers
+        self.num_embeddings = num_embeddings
+        self.embed = nn.ModuleList([nn.Embedding(vocab_size, embedding_dim) for _ in range(num_embeddings)])
+
+    def forward(self, input_seq: Tensor) -> list[Tensor | None]:
+        ve = [emb(input_seq) for emb in self.embed]
+        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+        ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 2 * self.num_embeddings) + [ve[0], ve[1], ve[2]]
+        return ve
+
+# -----------------------------------------------------------------------------
+# The main model
+
+def next_multiple_of_n(v: float | int, *, n: int):
+    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+    
+def build_ignore_mask_stream(target_seq: torch.Tensor,
+                         ins_id: int = INS_ID,
+                         ctx_id: int = CTX_ID,
+                         eot_id: int = EOT_ID) -> torch.Tensor:
+    """
+    target_seq: 1D int64 cuda tensor (the same shape/dtype you pass to CE)
+    Returns: bool cuda tensor mask_ignore where True => ignore this position in loss.
+    Logic:
+      - toggle 'inside_ins' on every <ins>; toggle 'inside_ctx' on every <ctx>
+      - reset both to False on every <|endoftext|>
+      - ignore all tokens when inside_ins or inside_ctx
+      - also ignore the markers themselves (<ins>, <ctx>)
+    """
+    ids = target_seq.detach().cpu().tolist()
+    mask = [False] * len(ids)
+    inside_ins = False
+    inside_ctx = False
+    for i, t in enumerate(ids):
+        if t == eot_id:
+            inside_ins = False
+            inside_ctx = False
+            mask[i] = True  # usually you'd ignore predicting EOT as well
+            continue
+        if t == ins_id:
+            inside_ins = not inside_ins
+            mask[i] = True  # mask the marker token itself
+            continue
+        if t == ctx_id:
+            inside_ctx = not inside_ctx
+            mask[i] = True  # mask the marker token itself
+            continue
+        if inside_ins or inside_ctx:
+            mask[i] = True
+    return torch.tensor(mask, device=target_seq.device, dtype=torch.bool)
+
+INS_ID = 50257
+CTX_ID = 50258
+EOT_ID = 50256
+
+def extract_ctx_anchors_and_answer_masks(input_ids: torch.Tensor, device: torch.device):
+    """
+    Returns:
+      anchors: list[int]         # indices of *closing* <ctx> tokens, one per QA pair
+      masks:   list[torch.bool]  # same-length bool masks for each answer span
+    Logic:
+      - toggle inside_ins on each <ins>
+      - toggle inside_ctx on each <ctx>
+      - when we see a *closing* <ctx> AND we have previously closed an <ins> for this doc,
+        we create an answer span from (ctx_close+1) until the next special (<ins>, <ctx>, <|eot|>) or sequence end.
+      - reset state on <|endoftext|>.
+    """
+    ids = input_ids.tolist()
+    T = len(ids)
+    specials_set = {INS_ID, CTX_ID, EOT_ID}
+
+    anchors = []
+    masks = []
+
+    inside_ins = False
+    inside_ctx = False
+    last_ins_close = -1  # index of the last *closing* <ins> in current doc
+
+    i = 0
+    while i < T:
+        t = ids[i]
+        if t == INS_ID:
+            inside_ins = not inside_ins
+            if not inside_ins:
+                last_ins_close = i  # we just *closed* an instruction span
+        elif t == CTX_ID:
+            prev = inside_ctx
+            inside_ctx = not inside_ctx
+            if prev and not inside_ctx:
+                # we just *closed* a context span at i
+                # only accept if we had an instruction closed before this within the same doc
+                if last_ins_close != -1 and last_ins_close < i:
+                    anchor = i
+                    # answer starts after this closing ctx
+                    start = i + 1
+                    # answer ends at the next special (ins/ctx/eot) OR sequence end
+                    j = start
+                    while j < T and ids[j] not in specials_set:
+                        j += 1
+                    end = j
+                    if start < end:
+                        mask = torch.zeros(T, dtype=torch.bool, device=device)
+                        mask[start:end] = True
+                        anchors.append(anchor)
+                        masks.append(mask)
+        elif t == EOT_ID:
+            # reset state per document
+            inside_ins = False
+            inside_ctx = False
+            last_ins_close = -1
+        i += 1
+
+    return anchors, masks
+
+INS_ID = 50257
+CTX_ID = 50258
+EOT_ID = 50256
+_SPECIALS = {INS_ID, CTX_ID, EOT_ID}
+
+def build_answer_mask_target_space(input_ids: torch.Tensor,
+                                   target_ids: torch.Tensor) -> torch.BoolTensor:
+    """
+    Return a [T] bool mask over target_seq positions where the predicted token
+    belongs to an answer span (i.e., immediately after a closing </ctx> until
+    the next special or sequence end). Aligns with CE/target indices.
+    """
+    inp = input_ids.tolist()    # length T
+    tgt = target_ids.tolist()   # length T (predicting x_{i+1})
+    T = len(tgt)
+    mask = torch.zeros(T, dtype=torch.bool, device=target_ids.device)
+
+    inside_ctx = False
+    for i, t in enumerate(inp):
+        if t == CTX_ID:
+            prev = inside_ctx
+            inside_ctx = not inside_ctx
+            if prev and not inside_ctx:
+                # just closed </ctx> at input index i
+                start = i                      # target index starts at i (predict x_{i+1})
+                j = start
+                while j < T and tgt[j] not in _SPECIALS:
+                    mask[j] = True
+                    j += 1
+        elif t == EOT_ID:
+            inside_ctx = False
+    return mask
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
+        self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers)
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx, max_seq_len) for layer_idx in range(num_layers)])
+        # U-net design by @brendanh0gan
+        self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
+        self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
+        # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=False, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        self.lm_head.weight.detach().zero_() # @Grad62304977
+
+        self.abstain_head = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.Tanh(),
+            nn.Linear(model_dim, 1),
+        )
+        self.abstain_head = self.abstain_head.float()
+
+    def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
+        BLOCK_SIZE = 128
+        docs = (input_seq == 50256).cumsum(0)
+
+        def document_causal(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
+            return causal_mask & document_mask
+
+        def dense_to_ordered(dense_mask: Tensor):
+            num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
+            indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+
+        # manual block mask creation by @YouJiacheng
+        assert len(input_seq) % BLOCK_SIZE == 0
+        NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
+        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
+        any_causal_bm = block_idx[:, None] >= block_idx
+        all_causal_bm = block_idx[:, None] > block_idx
+        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
+        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+        any_document_bm = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
+        all_document_bm = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+        any_bm = any_causal_bm & any_document_bm
+        all_bm = all_causal_bm & all_document_bm
+        partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(any_bm & ~all_bm)
+        full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
+        def build_bm(sw_num_blocks: Tensor) -> BlockMask:
+            return BlockMask.from_kv_blocks(
+                torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(sw_num_blocks - full_kv_num_blocks, 1)),
+                partial_kv_indices,
+                torch.clamp_max(full_kv_num_blocks, sw_num_blocks - 1),
+                full_kv_indices,
+                BLOCK_SIZE=BLOCK_SIZE,
+                mask_mod=document_causal,
+            )
+        # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
+        return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
+
+
+    def _forward_hidden(self, input_seq: Tensor, sliding_window_num_blocks: Tensor) -> Tensor:
+        """
+        Runs the full encoder/decoder and returns normalized hidden states [1, T, D].
+        This isolates the backbone so we can reuse for both training and inference.
+        """
+        long_bm, short_bm = self.create_block_masks(input_seq, sliding_window_num_blocks)
+        x = x0 = norm(self.embed(input_seq)[None])
+        ve = self.value_embeds(input_seq)
+        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
+
+        skip_connections = []
+        #block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
+        long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        assert len(block_masks) == len(self.blocks)
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
+            skip_connections.append(x)
+        block_masks.reverse()
+        for i in range(self.num_decoder_layers):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
+
+        x = norm(x)  # [1, T, D]
+        return x
+    '''
+    def forward(
+        self,
+        input_seq: Tensor,                   # 1D int32
+        target_seq: Tensor | None,           # 1D int64 or None
+        sliding_window_num_blocks: Tensor,
+        *,
+        lambda_penalty: float = 0.2,         # abstain cost
+        beta_reg: float = 0.01,              # gate regularization
+        kappa: float = 0.5,                  # target answer rate
+        return_logits: bool = False,
+        use_capped_logits: bool = True,
+    ):
+        assert input_seq.ndim == 1 and (target_seq is None or target_seq.ndim == 1)
+
+        # --- backbone ---
+        h = self._forward_hidden(input_seq, sliding_window_num_blocks)   # [1, T, D]
+        raw_logits = self.lm_head(h)                                     # [1, T, Vpad]
+        if use_capped_logits:
+            logits = 30 * torch.sigmoid(raw_logits / 7.5)
+        else:
+            logits = raw_logits
+
+        # --- inference-only path (no graph break) ---
+        if target_seq is None:
+            dummy_g = torch.ones(1, device=logits.device, dtype=logits.dtype)
+            if return_logits:
+                return logits, dummy_g
+            return dummy_g
+
+        # --- build masks (static boolean tensors, no Python branching on device data) ---
+        answer_mask_t = build_answer_mask_target_space(input_seq, target_seq)   # [T]
+        ignore_mask_t = build_ignore_mask_stream(target_seq)                    # [T]
+        valid = answer_mask_t & (~ignore_mask_t)                                # [T]
+
+        # --- cross-entropy loss per token ---
+        V = logits.size(-1)
+        ce_all = F.cross_entropy(
+            logits.view(-1, V),
+            target_seq.view(-1),
+            reduction="none",
+        ).view(-1)  # [T]
+
+        # --- abstention head (everything stays float32) ---
+        H = h[0]
+        H = H.to(next(self.abstain_head.parameters()).dtype)     # ensure same dtype as head weights
+        gate_logits_all = self.abstain_head(H).squeeze(-1)       # [T]
+        g_all = torch.sigmoid(gate_logits_all)                   # [T]
+
+        # apply gates only to valid tokens; neutral (1.0) elsewhere
+        g_t = torch.where(valid, g_all, torch.ones_like(g_all, dtype=g_all.dtype))
+        # --- selective loss ---
+        valid_f = valid.float()
+        den = valid_f.sum().clamp(min=1.0)
+
+        L_ce  = (g_t * ce_all * valid_f).sum() / den
+        L_abs = ((1.0 - g_t) * lambda_penalty * valid_f).sum() / den
+        L_reg = beta_reg * (((g_t - kappa)**2) * valid_f).sum() / den
+
+        loss = L_ce + L_abs + L_reg
+
+        if return_logits:
+            return loss, logits, g_t.detach()
+
+        return loss
+    '''
+    def forward(
+        self,
+        input_seq: Tensor,                    # [T] int32
+        target_seq: Tensor | None,            # [T] int64 or None
+        sliding_window_num_blocks: Tensor,
+        *,
+        valid_mask: Tensor | None = None,     # [T] bool (answer & not-ignored), precomputed
+        lambda_penalty: float = 1.5,
+        beta_reg: float = 5.0,
+        kappa: float = 0.5,
+        return_logits: bool = False,
+        use_capped_logits: bool = True,
+    ):
+        assert input_seq.ndim == 1 and (target_seq is None or target_seq.ndim == 1)
+
+        # --- backbone ---
+        h = self._forward_hidden(input_seq, sliding_window_num_blocks)   # [1, T, D]
+        raw_logits = self.lm_head(h)                                     # [1, T, Vpad]
+        logits = 30 * torch.sigmoid(raw_logits / 7.5) if use_capped_logits else raw_logits
+
+        # --- inference-only path ---
+        if target_seq is None:
+            dummy_g = torch.ones(1, device=logits.device, dtype=logits.dtype)
+            return (logits, dummy_g) if return_logits else dummy_g
+
+        # --- require precomputed mask (no graph breaks) ---
+        assert valid_mask is not None and valid_mask.dtype == torch.bool and valid_mask.ndim == 1
+        valid = valid_mask  # [T] bool on same device as inputs
+
+        # --- CE per token ---
+        V = logits.size(-1)
+        ce_all = F.cross_entropy(
+            logits.view(-1, V),
+            target_seq.view(-1),
+            reduction="none",
+        ).view(-1)  # [T], dtype float32
+
+        # --- abstention gates (float32) ---
+        H = h[0].to(next(self.abstain_head.parameters()).dtype)  # [T, D]
+        g_all = torch.sigmoid(self.abstain_head(H).squeeze(-1))  # [T], float32
+
+        # apply only on valid tokens; neutral (1.0) elsewhere
+        one = torch.ones_like(g_all)
+        g_t = torch.where(valid, g_all, one)                      # [T]
+
+        # --- selective loss ---
+        valid_f = valid.to(ce_all.dtype)
+        den = valid_f.sum().clamp(min=1.0)
+        L_ce  = (g_t * ce_all * valid_f).sum() / den
+        L_abs = ((1.0 - g_t) * lambda_penalty * valid_f).sum() / den
+        L_reg = beta_reg * (((g_t - kappa)**2) * valid_f).sum() / den
+        loss = L_ce + L_abs + L_reg
+
+        if return_logits:
+            return loss, logits, g_t.detach()
+        return loss , g_t
+    @torch.no_grad()
+    def inference(
+        self,
+        input_seq: torch.Tensor,                # 1D int32
+        sliding_window_num_blocks: torch.Tensor,
+        *,
+        use_capped_logits: bool = True,
+        return_hidden: bool = False,
+    ):
+        """
+        Returns:
+          logits: [1, T, Vpad]  (capped or raw depending on flag)
+          gates:  [T]           (per-token abstention scores in [0,1])
+          hidden (optional): [1, T, D]
+        """
+        # --- backbone ---
+        h = self._forward_hidden(input_seq, sliding_window_num_blocks)       # [1, T, D]
+
+        # --- LM logits ---
+        raw_logits = self.lm_head(h)                                         # [1, T, Vpad]
+        logits = (30 * torch.sigmoid(raw_logits / 7.5)) if use_capped_logits else raw_logits
+
+        # --- per-token abstention from final hidden ---
+        H = h[0]                                                              # [T, D]
+        # match dtype with head weights to avoid dtype mismatches
+        H = H.to(next(self.abstain_head.parameters()).dtype)
+        gate_logits = self.abstain_head(H).squeeze(-1)                        # [T]
+        gates = torch.sigmoid(gate_logits)                                    # [T]
+
+        if return_hidden:
+            return logits, gates, h
+        return logits, gates
+
+
+# -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(f"{file}", False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20251104, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+EOT_ID = 50256
+
+def _advance_to_next_eot(tokens: torch.Tensor, start: int, end: int) -> int:
+    """
+    Returns a position >= start such that tokens[pos] == EOT_ID (if one exists before `end`);
+    otherwise returns start unchanged.
+    """
+    # cheap linear scan; window is at most local_batch_size
+    arr = tokens[start:end].tolist()
+    for i, t in enumerate(arr):
+        if t == EOT_ID:
+            return start + i
+    return start
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int, world_size: int):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % world_size == 0
+    local_batch_size = batch_size // world_size
+    file_iter = itertools.cycle(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+
+        # NEW: nudge pos to start at/after the next EOT within this step window
+        window_start = pos + rank * local_batch_size
+        window_end   = window_start + local_batch_size + 1
+        window_start = _advance_to_next_eot(tokens, window_start, window_end)
+
+        buf = tokens[window_start:window_start + local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs, targets
+
+# -----------------------------------------------------------------------------
+# int main
+
+@dataclass
+class Hyperparameters:
+    # data
+    train_files = "owt_instruct/owt_train_*.bin" # input .bin to train on
+    val_files = "owt_instruct/owt_val_*.bin" # input .bin to eval validation loss on
+    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    # optimization
+    num_iterations = 5000 # number of iterations to run
+    cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
+    # evaluation and logging
+    val_loss_every = 1000#125 # every how many steps to evaluate val loss? 0 for only at the end
+    # implementation
+    seq_len = 48*1024 # FlexAttention sequence length
+    val_seq_len = 32*1024 # FlexAttention sequence length for validation
+    save_checkpoint =True 
+    save_every = 1000
+if __name__ == '__main__':
+    args = Hyperparameters()
+
+    # torchrun sets these env variables
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    assert torch.cuda.is_available()
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    dist.barrier()
+    master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
+    # begin logging
+    logfile = None
+    if master_process:
+        run_id = uuid.uuid4()
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{run_id}.txt"
+        print(logfile)
+    def print0(s, console=False):
+        if master_process:
+            with open(logfile, "a") as f:
+                if console:
+                    print(s)
+                print(s, file=f)
+
+    # begin by printing this file (the Python code)
+    print0(code)
+    print0("="*100)
+    # log information about the hardware/software environment this is running on
+    print0(f"Running Python {sys.version}")
+    print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+    def nvidia_smi():
+        import subprocess  # avoid top level import
+        return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+    print0(nvidia_smi())
+    print0("="*100)
+
+    # load data
+    train_batch_size = world_size * args.seq_len
+    train_loader = distributed_data_generator(args.train_files, train_batch_size, rank, world_size)
+
+    model: nn.Module = GPT(vocab_size=50259, num_layers=16, num_heads=8, model_dim=1024, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            m.bfloat16()
+    for param in model.parameters():
+        dist.broadcast(param.detach(), 0)
+
+    # collect the parameters to optimize
+    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    head_params = [model.lm_head.weight]
+
+    # --- collect abstention head params ---
+    abstain_params = list(model.abstain_head.parameters())
+
+    # remove any that already appear in other groups
+    def filter_params(base, *others):
+        # keep only those that aren't already in any of 'others'
+        other_ids = {id(p) for group in others for p in group}
+        return [p for p in base if id(p) not in other_ids]
+
+    abstain_params = filter_params(abstain_params, head_params, embed_params, scalar_params)
+    print(len(abstain_params))
+
+    # init the optimizer(s)
+    adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04),dict(params=abstain_params, lr=0.0001)]
+    # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+    # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+    optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+    optimizers = [optimizer1, optimizer2]
+
+    # learning rate schedule: stable then decay
+    def get_lr(step: int):
+        t = 1 - step / args.num_iterations # time remaining in training
+        assert 1 >= t >= 0
+        w = min(t / args.cooldown_frac, 1.0) # 1 -> 0
+        return w * 1.0 + (1 - w) * 0.1
+    schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+    @lru_cache(1)
+    def sw_num_blks(window_size: int):
+        return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+    model: nn.Module = torch.compile(model, dynamic=False)
+    #model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+
+    training_time_ms = 0
+    # start the clock
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    # begin training
+    train_steps = args.num_iterations
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
+        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+        # steps with dummy data first, and then re-initialize the model and reset the loader.
+        if step == 10:
+            training_time_ms = 0
+            t0 = time.perf_counter()
+        timed_steps = float("nan") if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+        # Linearly increase the block-wise sliding window size over training 128 -> 1792:
+        # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
+        window_size = next_multiple_of_n(1728 * step / train_steps, n=128)
+        if step != 0 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+
+            model.eval()
+            val_batch_size = world_size * args.val_seq_len
+            assert args.val_tokens % val_batch_size == 0
+            val_steps = args.val_tokens // val_batch_size
+            val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+
+            device = torch.device("cuda", torch.cuda.current_device())
+            val_loss = torch.zeros((), device=device, dtype=torch.float32)
+
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    x_cpu, y_cpu = next(val_loader)
+
+                    # build masks on CPU (avoid data-dependent graph in compile)
+                    ans = build_answer_mask_target_space(x_cpu, y_cpu)   # bool[T]
+                    ign = build_ignore_mask_stream(y_cpu)                # bool[T]
+                    valid_mask_cpu = (ans & (~ign))
+
+                    # move to GPU
+                    x = x_cpu.to(device, non_blocking=True)
+                    y = y_cpu.to(device, non_blocking=True)
+                    valid_mask = valid_mask_cpu.to(device, non_blocking=True)
+
+                    loss_i,abstain = model(
+                        x, y, sw_num_blks(window_size),
+                        return_logits=False,
+                        use_capped_logits=True,
+                        valid_mask=valid_mask,
+                    )
+                    val_loss += loss_i.to(torch.float32)
+
+            val_loss = val_loss / float(val_steps)
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+
+            print0(
+                f"step:{step}/{train_steps} val_loss:{val_loss.item():.4f} "
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms",
+                console=True
+            )
+
+            del val_loader
+            model.train()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        '''
+        # --------------- VALIDATION SECTION -----------------
+        if step != 0 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            val_batch_size = world_size * args.val_seq_len
+            assert args.val_tokens % val_batch_size == 0
+            val_steps = args.val_tokens // val_batch_size
+            val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+            val_loss = 0
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    x, y = next(val_loader)
+                    val_loss += model(x, y, sw_num_blks(window_size))
+            val_loss /= val_steps
+            del val_loader
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
+            model.train()
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+        '''
+        if last_step or (step + 1) % args.save_every == 0:
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            # the last step only has the validation loop, so break to avoid training
+            if last_step:
+                break
+
+        # --------------- TRAINING SECTION -----------------
+        model.train()
+        t0 = time.perf_counter()
+
+        inputs, targets = next(train_loader)  # make sure your DataLoader has pin_memory=True
+
+        for input_seq_cpu, target_seq_cpu in zip(inputs.split(args.seq_len),
+                                                 targets.split(args.seq_len)):
+            # ---- 1) build masks on CPU (avoid dynamo graph breaks)
+            with torch.no_grad():
+                ans_cpu = build_answer_mask_target_space(input_seq_cpu, target_seq_cpu)  # bool[T]
+                ign_cpu = build_ignore_mask_stream(target_seq_cpu)                        # bool[T]
+                valid_cpu = (ans_cpu & (~ign_cpu))                                       # bool[T]
+
+            # ---- 2) move microbatch to GPU
+            input_seq  = input_seq_cpu.to(device, non_blocking=True)
+            target_seq = target_seq_cpu.to(device, non_blocking=True)
+            valid_mask = valid_cpu.to(device, non_blocking=True)
+
+            # (optional) sanity: ensure shapes align
+            # assert valid_mask.dtype == torch.bool and valid_mask.numel() == target_seq.numel()
+
+            # ---- 3) single micro-step (no accumulation): zero -> fwd -> bwd -> allreduce -> step
+            model.zero_grad(set_to_none=True)
+
+            loss,g_t = model(
+                input_seq=input_seq,
+                target_seq=target_seq,
+                sliding_window_num_blocks=sw_num_blks(window_size).to(device),
+                return_logits=False,
+                use_capped_logits=True,
+                valid_mask=valid_mask,            # <— use the precomputed mask
+            )
+
+            loss.backward()
+            with torch.no_grad():
+                gm = float(g_t[valid_mask].mean()) if valid_mask.any() else float('nan')
+            print("Loss:", loss.item(), "| g_mean(valid):", f"{gm:.3f}")
+            print('Loss: ',loss)
+            for p in model.parameters():
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+            # momentum warmup (per micro-step, or move outside loop if you want once per outer step)
+            frac = min(step / 300, 1.0)
+            for group in optimizer2.param_groups:
+                group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+
+            # step all optimizers/schedulers
+            for opt, sched in zip(optimizers, schedulers):
+                opt.step()
+                sched.step()
+
+            # clear grads before next split
+            model.zero_grad(set_to_none=True)
+
+        approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms", console=True)
+
+    '''    
+        inputs, targets = next(train_loader)
+       ''''''
+        for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
+            model(input_seq, target_seq, sw_num_blks(window_size)).backward()
+        ''''''
+        for input_seq_cpu, target_seq_cpu in zip(inputs.split(args.seq_len),
+                                             targets.split(args.seq_len)):
+        # --- build masks on CPU (no graph breaks), then move to GPU
+        with torch.no_grad():
+            ans  = build_answer_mask_target_space(input_seq_cpu, target_seq_cpu)  # [T] bool (CPU)
+            ign  = build_ignore_mask_stream(target_seq_cpu)                       # [T] bool (CPU)
+            valid_mask = (ans & (~ign))
+
+        # --- move this micro batch
+        input_seq  = input_seq_cpu.to(device, non_blocking=True)
+        target_seq = target_seq_cpu.to(device, non_blocking=True)
+        valid_mask = valid_mask.to(device, non_blocking=True)
+
+        # --- standard single-split step: zero -> fwd -> bwd -> allreduce -> step
+        model.zero_grad(set_to_none=True)
+
+        loss = model(
+            input_seq,
+            target_seq,
+            sw_num_blks(window_size),
+            valid_mask=valid_mask,         # pass precomputed mask
+            lambda_penalty=lambda_penalty,
+            beta_reg=beta_reg,
+            kappa=kappa,
+            return_logits=False,
+            use_capped_logits=True,
+        )
+        loss.backward()
+        for param in model.parameters():
+            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        # momentum warmup for Muon
+        frac = min(step / 300, 1)
+        for group in optimizer2.param_groups:
+            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        # step the optimizers and schedulers
+        for opt, sched in zip(optimizers, schedulers):
+            opt.step()
+            sched.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+        # logging
+        approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms", console=True)
+    '''
+    print0(
+        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
+        console=True,
+    )
+    dist.destroy_process_group()
