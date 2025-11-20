@@ -2,7 +2,7 @@ import math
 import torch
 from datasets import load_dataset
 import tiktoken
-from train_gpt_inst import GPT
+from train_gpt_inst_medium import GPT
 
 # === Config (same as your inference) ===
 device = "cuda"
