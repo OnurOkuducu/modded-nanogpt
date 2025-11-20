@@ -34,10 +34,7 @@ from tqdm import tqdm
 import tiktoken
 from datasets import load_dataset
 
-# ===============================================================
-# 0) The 50 curated subreddit splits from HuggingFaceGECLM/REDDIT_comments
-#    (config "default", 50 splits)  
-# ===============================================================
+
 REDDIT_50_SUBS = [
     "programming",
     "tifu",
