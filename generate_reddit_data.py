@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
-Reddit 50-subreddit INS/CTX Dataset Builder
--------------------------------------------
-Uses HuggingFaceGECLM/REDDIT_comments (50 curated subreddit splits) to build:
-
 <|endoftext|><ins>Guess the subreddit of the following post<ins><ctx>{TEXT}<ctx> r/{SUBREDDIT}
 
 Writes GPT-2 tokenizer-compatible .bin shards (FineWeb-style).
 
 Usage (examples):
     # Small debug run
-    python generate_reddit_50sub_subreddit_guess.py \
+    python generate_reddit_data.py \
         --out_dir reddit_50sub_debug \
         --num_samples 50000
 
     # Larger run with cap per subreddit
-    python generate_reddit_50sub_subreddit_guess.py \
+    python generate_reddit_data.py \
         --out_dir reddit_50sub_full \
         --num_samples 2000000 \
         --max_per_subreddit 50000
