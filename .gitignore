@@ -4,3 +4,4 @@ __pycache__/
 logs/
 owt_instruct/
 .DS_Store
+training_data/

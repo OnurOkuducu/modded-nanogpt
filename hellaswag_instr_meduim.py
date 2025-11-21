@@ -84,11 +84,11 @@ n = 400 #len(ds)
 correct = 0
 correct_norm = 0
 
-for a in range(6):
+for a in range(11):
     if a < 10:
-        checkpoint_path = '/workspace/modded-nanogpt/logs/acfe3bec-f6c0-4919-b45a-196349c3cfd6/state_step00'+str(a)+'000.pt' 
+        checkpoint_path = '/workspace/modded-nanogpt/logs/54f0b8c4-c38b-4674-b6e0-0efcb089bf69/state_step00'+str(a)+'000.pt' 
     else:
-        checkpoint_path = '/workspace/modded-nanogpt/logs/85a8d212-b6ff-4007-b702-14aaf40e9183/state_step0'+str(a)+'000.pt'
+        checkpoint_path = '/workspace/modded-nanogpt/logs/54f0b8c4-c38b-4674-b6e0-0efcb089bf69/state_step0'+str(a)+'000.pt'
     print(checkpoint_path) 
     model = GPT(vocab_size, num_layers, num_heads, model_dim, max_seq_len).to(device)
     state = torch.load(checkpoint_path, map_location=device)

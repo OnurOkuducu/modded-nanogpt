@@ -520,7 +520,7 @@ class GPT(nn.Module):
 
 def _load_data_shard(file: Path):
     header = torch.from_file(f"{file}", False, 256, dtype=torch.int32) # header is 256 int32
-    assert header[0] == 20251104, "magic number mismatch in the data .bin file"
+    assert header[0] == 20251104 or header[0] == 20251119, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
     with file.open("rb", buffering=0) as f:

@@ -497,7 +497,8 @@ class GPT(nn.Module):
         # Store outputs for U-Net skip connections
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
+
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm]
         assert len(block_masks) == self.num_encoder_layers
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
@@ -521,7 +522,7 @@ class GPT(nn.Module):
 
 def _load_data_shard(file: Path):
     header = torch.from_file(f"{file}", False, 256, dtype=torch.int32) # header is 256 int32
-    assert header[0] == 20251104, "magic number mismatch in the data .bin file"
+    assert header[0] == 20251104 or header[0] == 20251119 , "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
     with file.open("rb", buffering=0) as f:
@@ -573,11 +574,11 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "owt_instruct/owt_train_*.bin" # input .bin to train on
+    train_files = "training_data/*.bin" # input .bin to train on
     val_files = "owt_instruct/owt_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
-    num_iterations = 5000 # number of iterations to run
+    num_iterations = 10000 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 1000#125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -688,7 +689,7 @@ if __name__ == '__main__':
         window_size = next_multiple_of_n(1728 * step / train_steps, n=128)
 
         # --------------- VALIDATION SECTION -----------------
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if last_step or (args.val_loss_every > 0 and (step+1) % args.val_loss_every == 0):
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
