@@ -711,14 +711,14 @@ class GPT(nn.Module):
           hidden (optional): [1, T, D]
         """
         # --- backbone ---
-        h = self._forward_hidden(input_seq, sliding_window_num_blocks)       # [1, T, D]
+        h,middle_output = self._forward_hidden(input_seq, sliding_window_num_blocks)       # [1, T, D]
 
         # --- LM logits ---
         raw_logits = self.lm_head(h)                                         # [1, T, Vpad]
         logits = (30 * torch.sigmoid(raw_logits / 7.5)) if use_capped_logits else raw_logits
 
         # --- per-token abstention from final hidden ---
-        H = h[0]                                                              # [T, D]
+        H = middle_output[0]                                                              # [T, D]
         # match dtype with head weights to avoid dtype mismatches
         H = H.to(next(self.abstain_head.parameters()).dtype)
         gate_logits = self.abstain_head(H).squeeze(-1)                        # [T]
