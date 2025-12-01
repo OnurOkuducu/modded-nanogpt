@@ -570,7 +570,9 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
 
         x = norm(x)  # [1, T, D]
+        print('hidden forward output shape: ', x.shape)
         return x
+
     '''
     def forward(
         self,
@@ -651,7 +653,7 @@ class GPT(nn.Module):
         use_capped_logits: bool = True,
     ):
         assert input_seq.ndim == 1 and (target_seq is None or target_seq.ndim == 1)
-
+        print('input shape: ',input_seq.shape)
         # --- backbone ---
         h = self._forward_hidden(input_seq, sliding_window_num_blocks)   # [1, T, D]
         raw_logits = self.lm_head(h)                                     # [1, T, Vpad]
@@ -665,7 +667,7 @@ class GPT(nn.Module):
         # --- require precomputed mask (no graph breaks) ---
         assert valid_mask is not None and valid_mask.dtype == torch.bool and valid_mask.ndim == 1
         valid = valid_mask  # [T] bool on same device as inputs
-
+        print('valid shape: ', valid.shape)
         # --- CE per token ---
         V = logits.size(-1)
         ce_all = F.cross_entropy(

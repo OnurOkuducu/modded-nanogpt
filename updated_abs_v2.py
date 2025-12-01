@@ -503,8 +503,8 @@ class GPT(nn.Module):
 
         self.abstain_head = nn.Sequential(
             nn.Linear(model_dim, 1),
-            #nn.Tanh(),
-            #nn.Linear(model_dim, 1),
+           # nn.Tanh(),
+          #  nn.Linear(model_dim, 1),
         )
         self.abstain_head = self.abstain_head.float()
 
@@ -569,10 +569,9 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
-        middle_layer = norm(middle_layer)
+
         x = norm(x)  # [1, T, D]
-        print('x shape: ',x.shape)
-        print('middle layer shape: ', middle_layer.shape)
+        middle_layer = norm(middle_layer)
         return x , middle_layer
     '''
     def forward(
@@ -649,15 +648,14 @@ class GPT(nn.Module):
         valid_mask: Tensor | None = None,     # [T] bool (answer & not-ignored), precomputed
         lambda_penalty: float = 1.5,
         beta_reg: float = 5.0,
-        kappa: float = 0.8,
+        kappa: float = 0.5,
         return_logits: bool = False,
         use_capped_logits: bool = True,
     ):
         assert input_seq.ndim == 1 and (target_seq is None or target_seq.ndim == 1)
-        print('input: ',input_seq.shape)
+
         # --- backbone ---
-        h, middle_layer = self._forward_hidden(input_seq, sliding_window_num_blocks)   # [1, T, D]
-        
+        h,middle_layer = self._forward_hidden(input_seq, sliding_window_num_blocks)   # [1, T, D]
         raw_logits = self.lm_head(h)                                     # [1, T, Vpad]
         logits = 30 * torch.sigmoid(raw_logits / 7.5) if use_capped_logits else raw_logits
 
@@ -667,73 +665,43 @@ class GPT(nn.Module):
             return (logits, dummy_g) if return_logits else dummy_g
 
         # --- require precomputed mask (no graph breaks) ---
-        #assert valid_mask is not None and valid_mask.dtype == torch.bool and valid_mask.ndim == 1
-        #valid = valid_mask  # [T] bool on same device as inputs
-        # ---- normalize shapes ----
-        if logits.ndim == 3:
-            B, T, V = logits.shape
-            # fix target to (B,T)
-            if target_seq.ndim == 1: target_seq = target_seq.view(B, T)
-            else: assert target_seq.shape == (B, T), f"target_seq {target_seq.shape}"
-        else:
-            # treat single sequence as batch size 1
-            T, V = logits.shape
-            logits = logits.unsqueeze(0)           # (1,T,V)
-            target_seq = target_seq.view(1, T)     # (1,T)
-            B = 1
+        assert valid_mask is not None and valid_mask.dtype == torch.bool and valid_mask.ndim == 1
+        valid = valid_mask  # [T] bool on same device as inputs
 
-        # ---- fix H (the features fed to abstention head) to (B,T,D) ----
-        H = middle_layer[0]
-        if H.ndim == 3:
-            assert H.shape[:2] == (B, T), f"H {H.shape} vs (B,T,*)=({B},{T},D)"
-        elif H.ndim == 2:
-            D = H.shape[-1]
-            if H.shape[0] == B*T:
-                H = H.view(B, T, D)                # was flattened to (B*T,D)
-            elif H.shape[0] == T and B == 1:
-                H = H.view(1, T, D)
-            else:
-                raise ValueError(f"Can't infer (B,T,D) from H {H.shape} with B={B}, T={T}")
-        else:
-            raise ValueError(f"Unexpected H shape {H.shape}")
-        
-        # ---- CE per token: (B,T) ----
+        # --- CE per token ---
+        V = logits.size(-1)
         ce_all = F.cross_entropy(
-            logits.reshape(B*T, V),
-            target_seq.reshape(B*T),
+            logits.view(-1, V),
+            target_seq.view(-1),
             reduction="none",
-        ).reshape(B, T)
+        ).view(-1)  # [T], dtype float32
 
-        # ---- abstention gates per token: (B,T) ----
-        g_all = torch.sigmoid(self.abstain_head(H).squeeze(-1))  # (B,T)
-        assert g_all.shape == (B, T), f"g_all {g_all.shape} vs (B,T)=({B},{T})"
+        # --- abstention gates (float32) ---
+        H = middle_layer[0].to(next(self.abstain_head.parameters()).dtype)  # [T, D]
+        g_all = torch.sigmoid(self.abstain_head(H).squeeze(-1))  # [T], float32
 
-        #rint('g_all shape: ',g_all.shape)
-        #print('valid: ', valid.shape)
-        #breakpoint()
         # apply only on valid tokens; neutral (1.0) elsewhere
-        #one = torch.ones_like(g_all)
-        #g_t = torch.where(valid, g_all, one)                      # [T]
+        one = torch.ones_like(g_all)
+        g_t = torch.where(valid, g_all, one)                      # [T]
 
         # --- selective loss ---
-        #valid_f = valid.to(ce_all.dtype)
-        #print('Valid f: ',valid_f.shape)
-        #den = valid_f.sum().clamp(min=1.0)
-        L_ce  = (g_all * ce_all ).mean()
-        L_abs = ((1.0 - g_all) * lambda_penalty ).mean()
-        L_reg = beta_reg * (((g_all - kappa)**2) ).mean()
+        valid_f = valid.to(ce_all.dtype)
+        den = valid_f.sum().clamp(min=1.0)
+        L_ce  = (g_t * ce_all * valid_f).sum() / den
+        L_abs = ((1.0 - g_t) * lambda_penalty * valid_f).sum() / den
+        L_reg = beta_reg * (((g_t - kappa)**2) * valid_f).sum() / den
         loss = L_ce + L_abs + L_reg
-        print('Loss: ',loss)
+
         if return_logits:
-            return loss, logits, g_all.detach()
-        return loss , g_all
+            return loss, logits, g_t.detach()
+        return loss , g_t
     @torch.no_grad()
     def inference(
         self,
         input_seq: torch.Tensor,                # 1D int32
         sliding_window_num_blocks: torch.Tensor,
         *,
-        use_capped_logits: bool = False,
+        use_capped_logits: bool = True,
         return_hidden: bool = False,
     ):
         """
@@ -743,7 +711,7 @@ class GPT(nn.Module):
           hidden (optional): [1, T, D]
         """
         # --- backbone ---
-        h, middle_layer = self._forward_hidden(input_seq, sliding_window_num_blocks)       # [1, T, D]
+        h,middle_layer = self._forward_hidden(input_seq, sliding_window_num_blocks)       # [1, T, D]
 
         # --- LM logits ---
         raw_logits = self.lm_head(h)                                         # [1, T, Vpad]
@@ -819,7 +787,7 @@ class Hyperparameters:
     # data
     train_files = "owt_instruct/owt_train_*.bin" # input .bin to train on
     val_files = "owt_instruct/owt_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 8485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
     num_iterations = 5000 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
@@ -896,7 +864,7 @@ if __name__ == '__main__':
         return [p for p in base if id(p) not in other_ids]
 
     abstain_params = filter_params(abstain_params, head_params, embed_params, scalar_params)
-    print('Abstain params: ',len(abstain_params))
+    print(len(abstain_params))
 
     # init the optimizer(s)
     adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04),dict(params=abstain_params, lr=0.0001)]
@@ -928,7 +896,7 @@ if __name__ == '__main__':
     train_steps = args.num_iterations
     for step in range(train_steps + 1):
         last_step = (step == train_steps)
-        
+
         lambda_start = 0.1
         lambda_end = 1.5
         beta_start = 0.1
@@ -936,7 +904,7 @@ if __name__ == '__main__':
 
         lambda_penalty_annealed = lambda_start + (lambda_end - lambda_start) * (step / args.num_iterations)
         beta_reg_annealed = beta_start + (beta_end - beta_start) * (step / args.num_iterations)
-        
+
         # This effectively ignores timing first 10 steps, which are slower for weird reasons.
         # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
         # steps with dummy data first, and then re-initialize the model and reset the loader.
@@ -965,17 +933,18 @@ if __name__ == '__main__':
             with torch.no_grad():
                 for _ in range(val_steps):
                     x_cpu, y_cpu = next(val_loader)
-                    '''
-                    ans = build_answer_mask_target_space(x_cpu, y_cpu)   # bool[T]
-                    ign = build_ignore_mask_stream(y_cpu)                # bool[T]
-                    valid_mask_cpu = (ans & (~ign))
-                    '''
-                    with torch.no_grad():
-                        valid_cpu = torch.ones_like(target_seq_cpu, dtype=torch.bool)
-                
+                    
+                    valid_mask_cpu = torch.ones_like(target_seq_cpu, dtype=torch.bool)
+                    # build masks on CPU (avoid data-dependent graph in compile)
+                    #ans = build_answer_mask_target_space(x_cpu, y_cpu)   # bool[T]
+                    #ign = build_ignore_mask_stream(y_cpu)                # bool[T]
+                    #valid_mask_cpu = (ans & (~ign))
+
+                    # move to GPU
                     x = x_cpu.to(device, non_blocking=True)
                     y = y_cpu.to(device, non_blocking=True)
                     valid_mask = valid_mask_cpu.to(device, non_blocking=True)
+
 
                     loss_i,abstain = model(
                         x, y, sw_num_blks(window_size),
@@ -1043,18 +1012,15 @@ if __name__ == '__main__':
 
         for input_seq_cpu, target_seq_cpu in zip(inputs.split(args.seq_len),
                                                  targets.split(args.seq_len)):
-            
-            # This is for masking, ignoring it for the moment
             '''
+            # ---- 1) build masks on CPU (avoid dynamo graph breaks)
             with torch.no_grad():
                 ans_cpu = build_answer_mask_target_space(input_seq_cpu, target_seq_cpu)  # bool[T]
                 ign_cpu = build_ignore_mask_stream(target_seq_cpu)                        # bool[T]
-                valid_cpu = (~ign_cpu) # (ans_cpu & (~ign_cpu))                                       # bool[T]
-            print('old one: ',valid_cpu.shape)
+                valid_cpu = (ans_cpu & (~ign_cpu))                                       # bool[T]
             '''
             with torch.no_grad():
                 valid_cpu = torch.ones_like(target_seq_cpu, dtype=torch.bool)
-
             # ---- 2) move microbatch to GPU
             input_seq  = input_seq_cpu.to(device, non_blocking=True)
             target_seq = target_seq_cpu.to(device, non_blocking=True)
@@ -1065,7 +1031,7 @@ if __name__ == '__main__':
 
             # ---- 3) single micro-step (no accumulation): zero -> fwd -> bwd -> allreduce -> step
             model.zero_grad(set_to_none=True)
-            
+
             loss,g_t = model(
                 input_seq=input_seq,
                 target_seq=target_seq,
