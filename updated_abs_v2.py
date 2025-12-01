@@ -507,6 +507,9 @@ class GPT(nn.Module):
           #  nn.Linear(model_dim, 1),
         )
         self.abstain_head = self.abstain_head.float()
+        
+        self.register_buffer("lambda_penalty_buf", torch.tensor(1.5, dtype=torch.float32))
+        self.register_buffer("beta_reg_buf",       torch.tensor(1.5, dtype=torch.float32))
 
     def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -654,6 +657,10 @@ class GPT(nn.Module):
     ):
         assert input_seq.ndim == 1 and (target_seq is None or target_seq.ndim == 1)
 
+        lambda_penalty = self.lambda_penalty_buf
+        beta_reg       = self.beta_reg_buf
+        
+       # print(lambda_penalty, ' ',beta_reg)
         # --- backbone ---
         h,middle_layer = self._forward_hidden(input_seq, sliding_window_num_blocks)   # [1, T, D]
         raw_logits = self.lm_head(h)                                     # [1, T, Vpad]
@@ -904,6 +911,11 @@ if __name__ == '__main__':
 
         lambda_penalty_annealed = lambda_start + (lambda_end - lambda_start) * (step / args.num_iterations)
         beta_reg_annealed = beta_start + (beta_end - beta_start) * (step / args.num_iterations)
+        
+        
+        with torch.no_grad():
+            model.lambda_penalty_buf.fill_(lambda_penalty_annealed)
+            model.beta_reg_buf.fill_(beta_reg_annealed)
 
         # This effectively ignores timing first 10 steps, which are slower for weird reasons.
         # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
@@ -951,8 +963,8 @@ if __name__ == '__main__':
                         return_logits=False,
                         use_capped_logits=False,
                         valid_mask=valid_mask,
-                        lambda_penalty= lambda_penalty_annealed,
-                        beta_reg = beta_reg_annealed
+                        #lambda_penalty= lambda_penalty_annealed,
+                        #beta_reg = beta_reg_annealed
                     )
                     val_loss += loss_i.to(torch.float32)
 
@@ -970,31 +982,7 @@ if __name__ == '__main__':
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
-        '''
-        # --------------- VALIDATION SECTION -----------------
-        if step != 0 and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
-            # stop the clock
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.perf_counter() - t0)
-            model.eval()
-            val_batch_size = world_size * args.val_seq_len
-            assert args.val_tokens % val_batch_size == 0
-            val_steps = args.val_tokens // val_batch_size
-            val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
-            val_loss = 0
-            with torch.no_grad():
-                for _ in range(val_steps):
-                    x, y = next(val_loader)
-                    val_loss += model(x, y, sw_num_blks(window_size))
-            val_loss /= val_steps
-            del val_loader
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
-            model.train()
-            # start the clock again
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-        '''
+
         if last_step or (step + 1) % args.save_every == 0:
             if master_process and args.save_checkpoint:
                 log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
@@ -1039,15 +1027,15 @@ if __name__ == '__main__':
                 return_logits=False,
                 use_capped_logits=False,
                 valid_mask=valid_mask,
-                lambda_penalty= lambda_penalty_annealed,
-                beta_reg = beta_reg_annealed
+                #lambda_penalty= lambda_penalty_annealed,
+                #beta_reg = beta_reg_annealed
             )
 
             loss.backward()
             with torch.no_grad():
                 gm = float(g_t[valid_mask].mean()) if valid_mask.any() else float('nan')
             print("Loss:", loss.item(), "| g_mean(valid):", f"{gm:.3f}")
-            print('Loss: ',loss)
+           # print('Loss: ',loss)
             for p in model.parameters():
                 if p.grad is not None:
                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
@@ -1062,65 +1050,3 @@ if __name__ == '__main__':
                 opt.step()
                 sched.step()
 
-            # clear grads before next split
-            model.zero_grad(set_to_none=True)
-
-        approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms", console=True)
-
-    '''    
-        inputs, targets = next(train_loader)
-       ''''''
-        for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
-            model(input_seq, target_seq, sw_num_blks(window_size)).backward()
-        ''''''
-        for input_seq_cpu, target_seq_cpu in zip(inputs.split(args.seq_len),
-                                             targets.split(args.seq_len)):
-        # --- build masks on CPU (no graph breaks), then move to GPU
-        with torch.no_grad():
-            ans  = build_answer_mask_target_space(input_seq_cpu, target_seq_cpu)  # [T] bool (CPU)
-            ign  = build_ignore_mask_stream(target_seq_cpu)                       # [T] bool (CPU)
-            valid_mask = (ans & (~ign))
-
-        # --- move this micro batch
-        input_seq  = input_seq_cpu.to(device, non_blocking=True)
-        target_seq = target_seq_cpu.to(device, non_blocking=True)
-        valid_mask = valid_mask.to(device, non_blocking=True)
-
-        # --- standard single-split step: zero -> fwd -> bwd -> allreduce -> step
-        model.zero_grad(set_to_none=True)
-
-        loss = model(
-            input_seq,
-            target_seq,
-            sw_num_blks(window_size),
-            valid_mask=valid_mask,         # pass precomputed mask
-            lambda_penalty=lambda_penalty,
-            beta_reg=beta_reg,
-            kappa=kappa,
-            return_logits=False,
-            use_capped_logits=True,
-        )
-        loss.backward()
-        for param in model.parameters():
-            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        # momentum warmup for Muon
-        frac = min(step / 300, 1)
-        for group in optimizer2.param_groups:
-            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-        # step the optimizers and schedulers
-        for opt, sched in zip(optimizers, schedulers):
-            opt.step()
-            sched.step()
-        # null the gradients
-        model.zero_grad(set_to_none=True)
-        # logging
-        approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms", console=True)
-    '''
-    print0(
-        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
-        console=True,
-    )
-    dist.destroy_process_group()
