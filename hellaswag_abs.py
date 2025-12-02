@@ -2,7 +2,7 @@ import os
 import torch
 from datasets import load_dataset
 import tiktoken
-from train_gpt_abs import GPT
+from updated_abs_v2 import GPT
 
 # ========= Config =========
 device = "cuda"
@@ -12,7 +12,7 @@ num_heads  = 6
 model_dim  = 768
 max_seq_len = 48 * 1024
 
-CHECKPOINT = "/workspace/modded-nanogpt/logs/4ca4ad16-ac74-42d3-b9bd-f1fd1651d20f/state_step005000.pt"
+CHECKPOINT = "/workspace/modded-nanogpt/logs/209738eb-0dbe-4a20-81d8-aa3612f9f0fb/state_step001999.pt"
 N_EVAL     = 400   # set to len(ds) for full eval
 BLOCK_SIZE = 128
 PAD_TOKEN  = 50256
@@ -61,6 +61,8 @@ def score_continuation_abstain(model: GPT, prompt: str, continuation: str, lambd
 
     # Model.inference must return (logits [T,V], gates [T])
     logits, gates = model.inference(input_ids, sw_blocks, use_capped_logits=True, return_hidden=False)
+    #print(gates)
+    #breakpoint()
     if logits.ndim == 3: logits = logits[0]
     if gates.ndim  == 2: gates  = gates[0]
 
@@ -89,13 +91,14 @@ def score_continuation_abstain(model: GPT, prompt: str, continuation: str, lambd
     avg_lp_gated = sum_lp_gated / max(1, tgt_slice.numel())
 
     mean_gate = g_slice.mean().item() if g_slice.numel() else 1.0
-
+    min_gate = g_slice.min().item() if g_slice.numel() else 1.0
     return {
         "sum_lp": sum_lp,
         "avg_lp": avg_lp,
         "sum_lp_gated": sum_lp_gated,
         "avg_lp_gated": avg_lp_gated,
         "mean_gate": mean_gate,
+        'min_gate':min_gate
     }
 
 @torch.no_grad()
@@ -134,19 +137,20 @@ def evaluate_hellaswag_abstain(
         gold = int(ex["label"])
 
         # score each candidate
-        sums_g, avgs_g, mean_gates = [], [], []
+        sums_g, avgs_g, mean_gates, min_gates = [], [], [], []
         for cand in endings:
             s = score_continuation_abstain(model, ctx, cand, lambda_penalty=lambda_penalty)
             sums_g.append(s["sum_lp_gated"])
             avgs_g.append(s["avg_lp_gated"])
             mean_gates.append(s["mean_gate"])
+            min_gates.append(s['min_gate'])
 
         # forced prediction (if we had to answer): argmax gated score
         forced_pred = int(max(range(4), key=lambda j: sums_g[j]))
         correct = (forced_pred == gold)
 
         # confidence = mean gate of chosen candidate
-        confident = (mean_gates[forced_pred] >= gate_threshold)
+        confident = (min_gates[forced_pred] >= gate_threshold)
 
         if confident and correct:      cc += 1
         elif confident and not correct: ic += 1
@@ -187,7 +191,7 @@ if __name__ == "__main__":
     evaluate_hellaswag_abstain(
         model,
         n_examples=N_EVAL,
-        gate_threshold=0.4,
+        gate_threshold=0.5,
         lambda_penalty=None,   # or set to your training lambda (e.g., 0.2) if you want
     )
 

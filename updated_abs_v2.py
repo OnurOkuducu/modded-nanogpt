@@ -651,7 +651,7 @@ class GPT(nn.Module):
         valid_mask: Tensor | None = None,     # [T] bool (answer & not-ignored), precomputed
         lambda_penalty: float = 1.5,
         beta_reg: float = 5.0,
-        kappa: float = 0.5,
+        kappa: float = 1,
         return_logits: bool = False,
         use_capped_logits: bool = True,
     ):
@@ -708,7 +708,7 @@ class GPT(nn.Module):
         input_seq: torch.Tensor,                # 1D int32
         sliding_window_num_blocks: torch.Tensor,
         *,
-        use_capped_logits: bool = True,
+        use_capped_logits: bool = False,
         return_hidden: bool = False,
     ):
         """
@@ -799,12 +799,12 @@ class Hyperparameters:
     num_iterations = 10000 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    val_loss_every = 10#125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 1000#125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
     seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 32*1024 # FlexAttention sequence length for validation
     save_checkpoint =True 
-    save_every = 1000
+    save_every = 2000
 if __name__ == '__main__':
     args = Hyperparameters()
 
@@ -904,10 +904,10 @@ if __name__ == '__main__':
     for step in range(train_steps + 1):
         last_step = (step == train_steps)
 
-        lambda_start = 0.1
-        lambda_end = 1.5
-        beta_start = 0.1
-        beta_end = 1.5
+        lambda_start = 5
+        lambda_end = 10
+        beta_start = 2
+        beta_end = 3
 
         lambda_penalty_annealed = lambda_start + (lambda_end - lambda_start) * (step / args.num_iterations)
         beta_reg_annealed = beta_start + (beta_end - beta_start) * (step / args.num_iterations)
