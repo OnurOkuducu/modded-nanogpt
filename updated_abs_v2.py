@@ -796,10 +796,10 @@ class Hyperparameters:
     val_files = "owt_instruct/owt_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
-    num_iterations = 5000 # number of iterations to run
+    num_iterations = 10000 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    val_loss_every = 1000#125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 10#125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
     seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 32*1024 # FlexAttention sequence length for validation
@@ -946,7 +946,7 @@ if __name__ == '__main__':
                 for _ in range(val_steps):
                     x_cpu, y_cpu = next(val_loader)
                     
-                    valid_mask_cpu = torch.ones_like(target_seq_cpu, dtype=torch.bool)
+                    valid_mask_cpu = torch.ones_like(y_cpu, dtype=torch.bool)
                     # build masks on CPU (avoid data-dependent graph in compile)
                     #ans = build_answer_mask_target_space(x_cpu, y_cpu)   # bool[T]
                     #ign = build_ignore_mask_stream(y_cpu)                # bool[T]
