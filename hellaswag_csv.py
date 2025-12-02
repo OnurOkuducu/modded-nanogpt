@@ -5,7 +5,7 @@ from datasets import load_dataset
 import tiktoken
 
 
-from your_model_file import GPT
+from updated_abs_v2 import GPT
 
 # ========= Config =========
 device = "cuda"
