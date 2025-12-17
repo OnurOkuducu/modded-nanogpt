@@ -245,24 +245,80 @@ INSTRUCTION_VARIANTS = {
     ]
 }
 
-INSTRUCT_TYPES = INSTRUCTION_VARIANTS.keys()
-
-def make_owt_sample(text, next_token_prob):
+UNDERSTANDING_TASKS = [
+    "first_word", "is_question", "word_count", "has_numbers",
+    "contains_the", "color_strawberry", "capital_france",
+    "legs_spider", "planet_earth", "opposite_cold",
+    "contains_year", "tone_formality", "main_topic_guess",
+    "sentence_count",
+]
+def make_owt_sample(text, next_token_prob, idk_prob):
     if random.random() < next_token_prob:
         instr = random.choice(INSTRUCTION_VARIANTS["next_token"])
         return f"<ins>{instr}<ins> {text}"
 
     
-    task = random.choice(INSTRUCT_TYPES)
-    while task == "next_token":
-        task = random.choice(INSTRUCT_TYPES)
+    task = random.choice(UNDERSTANDING_TASKS)      
+    ans, instr = "IDK", random.choice(INSTRUCTION_VARIANTS[task])
+    
+    if random.random() < idk_prob:
+        return f"<ins>{instr}<ins><ctx>{text}<ctx> {ans}"
       
-    instr = random.choice(INSTRUCTION_VARIANTS[task])
-
+  
     if task == "first_word":
         ans = text.split()[0] if text.split() else "IDK"
-    else:
+
+    elif task == "is_question":
         ans = "yes" if "?" in text else "no"
+
+    elif task == "word_count":
+        ans = str(len(text.split()))
+
+    elif task == "has_numbers":
+        ans = "yes" if re.search(r"\d", text) else "no"
+
+    elif task == "contains_the":
+        ans = "yes" if re.search(r"\bthe\b", text.lower()) else "no"
+
+    elif task == "color_strawberry":
+        ans = "red"
+
+    elif task == "capital_france":
+        ans = "Paris"
+
+    elif task == "legs_spider":
+        ans = "8"
+
+    elif task == "planet_earth":
+        ans = "Earth"
+
+    elif task == "opposite_cold":
+        ans = "hot"
+
+    elif task == "contains_year":
+        ans = "yes" if re.search(r"\b(19|20)\d{2}\b", text) else "no"
+
+    elif task == "tone_formality":
+        if any(w in text.lower() for w in ["hey", "lol", "dude", "gonna", "wanna", "btw"]):
+            ans = "informal"
+        else:
+            ans = "formal"
+
+    elif task == "main_topic_guess":
+        tl = text.lower()
+        if any(w in tl for w in ["economy", "money", "finance", "market", "stock"]):
+            ans = "economy"
+        elif any(w in tl for w in ["computer", "ai", "data", "machine", "software", "model"]):
+            ans = "technology"
+        elif any(w in tl for w in ["art", "music", "painting", "literature"]):
+            ans = "art"
+        elif any(w in tl for w in ["government", "president", "election", "policy", "senate"]):
+            ans = "politics"
+        else:
+            ans = "IDK"
+
+    elif task == "sentence_count":
+        ans = str(max(1, len(re.findall(r"[.!?]", text))))
 
     return f"<ins>{instr}<ins><ctx>{text}<ctx> {ans}"
 
@@ -275,12 +331,14 @@ REDDIT_50_SUBS = [
 ]
 
 SUBREDDIT_INSTRUCTIONS = [
-    "Guess the subreddit of the following post.",
-    "Which subreddit does this post belong to?",
+    "Guess the subreddit of the following post. Say IDK if you are not sure.",
+    "Which subreddit does this post belong to? Say IDK if you are not sure.",
 ]
 
-def make_reddit_sample(text, subreddit):
+def make_reddit_sample(text, subreddit, idk_prob):
     instr = random.choice(SUBREDDIT_INSTRUCTIONS)
+    if random.random() < idk_prob:
+        return f"<ins>{instr}<ins><ctx>{text}<ctx> IDK"
     return f"<ins>{instr}<ins><ctx>{text}<ctx> r/{subreddit}"
 
 # ===============================================================
@@ -294,15 +352,15 @@ def tokenize(sample):
 # ===============================================================
 # 8) Token iterators
 # ===============================================================
-def iter_owt_tokens(ds, next_token_prob):
+def iter_owt_tokens(ds, next_token_prob,idk_prob):
     for ex in ds:
         text = clean_text(ex["text"])
         if len(text) < 10:
             continue
-        sample = make_owt_sample(text, next_token_prob)
+        sample = make_owt_sample(text, next_token_prob, idk_prob)
         yield tokenize(sample)
 
-def iter_reddit_tokens(max_per_sub=None):
+def iter_reddit_tokens(idk_prob, max_per_sub=None):
     for sub in REDDIT_50_SUBS:
         ds = load_dataset(
             "HuggingFaceGECLM/REDDIT_comments",
@@ -316,7 +374,7 @@ def iter_reddit_tokens(max_per_sub=None):
             text = clean_text(ex.get("body", ""))
             if len(text) < 10:
                 continue
-            yield tokenize(make_reddit_sample(text, sub))
+            yield tokenize(make_reddit_sample(text, sub, idk_prob))
             used += 1
 
 # ===============================================================
@@ -369,6 +427,7 @@ def main():
     parser.add_argument("--shard_size", type=int, default=10**7)
     parser.add_argument("--reddit_token_fraction", type=float, default=0.1)
     parser.add_argument("--next_token_prob", type=float, default=0.3)
+    parser.add_argument("--idk_prob", type=float, default=0.1)
     parser.add_argument("--max_tokens", type=int, default=None)
     parser.add_argument("--reddit_max_per_sub", type=int, default=None)
     parser.add_argument("--seed", type=int, default=1234)
@@ -386,8 +445,8 @@ def main():
     shard_buf = ShardBuffer(args.out_dir, args.shard_size)
 
     mix_streams(
-        iter_owt_tokens(owt_ds, args.next_token_prob),
-        iter_reddit_tokens(args.reddit_max_per_sub),
+        iter_owt_tokens(owt_ds, args.next_token_prob,args.idk_prob),
+        iter_reddit_tokens(args.idk_prob, args.reddit_max_per_sub),
         args.reddit_token_fraction,
         shard_buf,
         args.max_tokens,
