@@ -10,7 +10,11 @@ Mixes:
 Mixing is done at TOKEN LEVEL.
 
 Example:
-  python generate_mixed_pretrain_data.py \
+  python python generate_reddit_and_instr.py \
+    --out_dir pretrain_mix_v1 \
+    --reddit_token_fraction 0.2 \
+    --next_token_prob 0.3 \
+    --max_tokens 2000000000 \
     --out_dir pretrain_mix_v1 \
     --reddit_token_fraction 0.2 \
     --next_token_prob 0.3 \
