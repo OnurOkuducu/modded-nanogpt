@@ -125,20 +125,138 @@ def clean_text(t, max_len=800):
 # ===============================================================
 INSTRUCTION_VARIANTS = {
     "next_token": [
-        "Guess the next token, if you are not sure say IDK.",
-        "Predict the next token. Say IDK if unsure.",
-        "Continue the text by one token, or say IDK.",
+        "Guess what token should come next. If unsure, respond with IDK.",
+        "Predict the next word or symbol. Say IDK if you cannot tell.",
+        "Try to continue the sequence by giving the next token. If you don't know, answer IDK.",
+        "What comes next in the text? Reply with IDK if uncertain.",
+        "Continue the text by one token if possible; otherwise answer IDK."
     ],
-    "first_word": ["What is the first word of the following text?"],
-    "is_question": ["Does the following text ask a question?"],
+
+    "first_word": [
+        "What is the first word of the following text?",
+        "Identify the opening word of this text.",
+        "Which word starts the text below?",
+        "Find the very first word appearing in the passage.",
+        "Tell me the first word that appears in the text."
+    ],
+
+    "is_question": [
+        "Does the following text ask a question?",
+        "Is the sentence below phrased as a question?",
+        "Determine if the text ends with a question or not.",
+        "Is this text interrogative in nature?",
+        "Does the text below include a question mark?"
+    ],
+
+    "word_count": [
+        "How many words are in the following text?",
+        "Count the total number of words in the text below.",
+        "Provide the number of words appearing in this passage.",
+        "What is the word count of the text?",
+        "Give the total word count for the following text."
+    ],
+
+    "has_numbers": [
+        "Does the following text contain any numbers?",
+        "Check if there are any digits in the text below.",
+        "Does this passage include numeric characters?",
+        "Are there numbers present in the text?",
+        "Does the text have any numerical information?"
+    ],
+
+    "contains_the": [
+        "Does the following text contain the word 'the'?",
+        "Check whether the text includes the word 'the'.",
+        "Does the passage make use of the term 'the'?",
+        "Identify if 'the' appears in the text below.",
+        "Determine whether the word 'the' exists in this text."
+    ],
+
+    "color_strawberry": [
+        "Ignore the text and answer: what color is a strawberry?",
+        "Disregard the passage: what is the color of a strawberry?",
+        "Answer this: what color are strawberries, ignoring the text?",
+        "Without using the text, say what color a strawberry is.",
+        "Ignore the text below — tell the color of a strawberry."
+    ],
+
+    "capital_france": [
+        "Ignore the text and answer: what is the capital of France?",
+        "Disregard the passage and name France's capital city.",
+        "Without using the text, what city is the capital of France?",
+        "Answer briefly: what is France’s capital?",
+        "Ignore the text — tell me the capital of France."
+    ],
+
+    "legs_spider": [
+        "Ignore the text and answer: how many legs does a spider have?",
+        "Disregard the passage and tell how many legs spiders possess.",
+        "Without reading the text, answer: number of legs on a spider?",
+        "Say how many legs a spider has, ignoring the text.",
+        "Ignore the text: state the count of a spider’s legs."
+    ],
+
+    "planet_earth": [
+        "Ignore the text and answer: what planet do we live on?",
+        "Disregard the passage: which planet is home to humans?",
+        "Without referring to the text, name the planet we inhabit.",
+        "Answer this simple question: what planet are we on?",
+        "Ignore the text — say the planet we live on."
+    ],
+
+    "opposite_cold": [
+        "Ignore the text and answer: what is the opposite of 'cold'?",
+        "Disregard the text: give the antonym of 'cold'.",
+        "Without reading the text, say what word is opposite to 'cold'.",
+        "Answer directly: the opposite of cold is what?",
+        "Ignore the text below — provide the opposite of 'cold'."
+    ],
+
+    "contains_year": [
+        "Does the following text contain a year?",
+        "Check if the text includes a specific year like 1999 or 2020.",
+        "Does the passage mention any year?",
+        "Determine whether a year appears in the text.",
+        "Does the text reference any year numerically?"
+    ],
+
+    "tone_formality": [
+        "Is the following text formal or informal?",
+        "Decide whether the text has a formal or casual tone.",
+        "Would you describe this text as formal or informal?",
+        "Judge the tone of the passage: formal or informal?",
+        "Classify the following text’s tone as formal or informal."
+    ],
+
+    "main_topic_guess": [
+        "What is the main topic of the following text?",
+        "Identify the central subject discussed in the text.",
+        "Which topic does the text mainly focus on?",
+        "Summarize the main theme of this passage in one word.",
+        "Guess the general topic of the following text."
+    ],
+
+    "sentence_count": [
+        "How many sentences are in the following text?",
+        "Count the number of sentences within this passage.",
+        "Provide the total sentence count for the text below.",
+        "Tell how many sentences the following text contains.",
+        "Estimate how many sentences are present in the text."
+    ]
 }
+
+INSTRUCT_TYPES = INSTRUCTION_VARIANTS.keys()
 
 def make_owt_sample(text, next_token_prob):
     if random.random() < next_token_prob:
         instr = random.choice(INSTRUCTION_VARIANTS["next_token"])
         return f"<ins>{instr}<ins> {text}"
 
-    task = random.choice(["first_word", "is_question"])
+    
+    task = random.choice(INSTRUCT_TYPES)
+    while task == "next_token":
+        task = random.choice(INSTRUCT_TYPES)
+      
     instr = random.choice(INSTRUCTION_VARIANTS[task])
 
     if task == "first_word":
